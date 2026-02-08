@@ -4,4 +4,5 @@ pillow
 torch
 transformers
 mediapipe
+opencv-python-headless
 

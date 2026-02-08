@@ -1,22 +1,15 @@
 # app.py
-# BirdLookalike — Mobile-friendly (Camera + Upload) + robust face crop (FaceLandmarker mesh) + DEBUG
-# + 1-to-1 best bird match + confidence + (optional) bird image if present in repo.
+# BirdLookalike — Mobile (camera/upload) + compact UI + robust face crop:
+#   1) MediaPipe FaceLandmarker mesh (best)
+#   2) OpenCV Haar cascade fallback (reliable on cloud)
+# + CLIP embedding match + confidence + optional bird image display
 #
-# Mobile UI improvements:
-# - layout="centered"
-# - downsized display images (keeps screen compact)
-# - bird image shown inside expander
+# Streamlit Cloud note:
+# - If MediaPipe fails, use Python 3.12 (recommended) and/or rely on OpenCV fallback.
 #
-# IMPORTANT (Streamlit Cloud):
-# - MediaPipe often fails on Python 3.13. Prefer Python 3.12 in Streamlit Cloud settings.
-#
-# Repo must contain (for matching):
-#   bird_embeddings.npy
-#   bird_metadata.json
-# Optional (for displaying bird images):
-#   birds/... images referenced by bird_metadata.json (or switch to birds_preview approach)
+# requirements.txt:
+#   streamlit numpy pillow torch transformers mediapipe opencv-python-headless
 
-import os
 import json
 import urllib.request
 from io import BytesIO
@@ -36,9 +29,12 @@ EMB_FILE = "bird_embeddings.npy"
 META_FILE = "bird_metadata.json"
 
 # -------------------------
-# MediaPipe FaceLandmarker model (download to cache, not repo)
+# Cache directory (safe on Streamlit Cloud)
 # -------------------------
 CACHE_DIR = Path.home() / ".cache" / "birdlookalike"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# MediaPipe task model
 MP_MODELS = CACHE_DIR / "models"
 MP_MODELS.mkdir(parents=True, exist_ok=True)
 
@@ -48,10 +44,17 @@ FACE_LANDMARKER_URL = (
     "face_landmarker/float16/latest/face_landmarker.task"
 )
 
-# -------------------------
-# Mobile-friendly display settings
-# -------------------------
-DISPLAY_MAX_W = 360  # good on most phones (adjust if you like)
+# OpenCV Haar cascade (fallback)
+OPENCV_MODELS = CACHE_DIR / "opencv"
+OPENCV_MODELS.mkdir(parents=True, exist_ok=True)
+
+HAAR_PATH = OPENCV_MODELS / "haarcascade_frontalface_default.xml"
+HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+
+# Mobile-friendly display
+DISPLAY_MAX_W = 360
+
+st.set_page_config(page_title="BirdLookalike (Mobile)", layout="centered")
 
 
 def resize_for_display(img: Image.Image, max_w: int = DISPLAY_MAX_W) -> Image.Image:
@@ -62,11 +65,8 @@ def resize_for_display(img: Image.Image, max_w: int = DISPLAY_MAX_W) -> Image.Im
     return img.resize((max_w, new_h))
 
 
-st.set_page_config(page_title="BirdLookalike (Mobile)", layout="centered")
-
-
 # -------------------------
-# Path helpers (Cloud-safe)
+# Path helpers
 # -------------------------
 def find_repo_root() -> Path:
     here = Path(__file__).resolve().parent
@@ -80,32 +80,36 @@ REPO_ROOT = find_repo_root()
 
 
 def resolve_asset(path_str: str) -> Path:
-    """
-    Resolve:
-    - relative paths like 'birds/...'
-    - absolute local paths like '/Users/.../birds/...'
-    """
     s = str(path_str).replace("\\", "/")
-
     # Convert absolute local path to repo-relative birds/...
     if s.startswith("/") and "/birds/" in s:
         s = "birds/" + s.split("/birds/", 1)[1]
-
     cand = REPO_ROOT / s
     if cand.exists():
         return cand
-
-    # fix accidental duplication: birds/birds/...
     if s.startswith("birds/"):
         cand2 = REPO_ROOT / s[len("birds/") :]
         if cand2.exists():
             return cand2
-
-    return (Path(__file__).resolve().parent / s)
+    return Path(__file__).resolve().parent / s
 
 
 # -------------------------
-# Device helper (CPU / MPS / CUDA)
+# Download helper
+# -------------------------
+def download_if_missing(url: str, dst: Path) -> bool:
+    if dst.exists():
+        return True
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(url, str(dst))
+        return True
+    except Exception:
+        return False
+
+
+# -------------------------
+# Device helper
 # -------------------------
 def get_device():
     if torch.cuda.is_available():
@@ -134,47 +138,46 @@ def load_clip():
 def load_index():
     emb_path = resolve_asset(EMB_FILE)
     meta_path = resolve_asset(META_FILE)
-
     if not emb_path.exists() or not meta_path.exists():
-        raise FileNotFoundError(
-            f"Missing {EMB_FILE} or {META_FILE} in repo. "
-            f"Found: {emb_path.exists()} / {meta_path.exists()}"
-        )
-
+        raise FileNotFoundError(f"Missing {EMB_FILE} or {META_FILE} in the repo.")
     embs = np.load(str(emb_path)).astype(np.float32)
     with open(str(meta_path), "r", encoding="utf-8") as f:
         meta = json.load(f)
-
     embs /= (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)
     return embs, meta
 
 
 # -------------------------
-# MediaPipe FaceLandmarker: ensure model + create landmarker
+# Face crop backends
 # -------------------------
-def ensure_face_landmarker_model() -> bool:
-    if FACE_LANDMARKER_PATH.exists():
-        return True
-    try:
-        urllib.request.urlretrieve(FACE_LANDMARKER_URL, str(FACE_LANDMARKER_PATH))
-        return True
-    except Exception:
-        return False
-
-
-def create_face_landmarker():
+def crop_with_mediapipe_landmarks(img: Image.Image, margin: float, debug: bool):
     """
-    Creates a FaceLandmarker instance.
-    Returns None if mediapipe or model is unavailable.
+    Returns (cropped_img, info_dict). If fails, info['ok']=False with details.
     """
+    info = {
+        "ok": False,
+        "backend": "mediapipe",
+        "reason": "",
+        "faces": 0,
+        "model_path": str(FACE_LANDMARKER_PATH),
+    }
+
+    # Fix rotations (very important for mobile photos)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    # Import mediapipe
     try:
         import mediapipe as mp
-    except Exception:
-        return None
+    except Exception as e:
+        info["reason"] = f"mediapipe import failed: {e}"
+        return img, info
 
-    if not ensure_face_landmarker_model():
-        return None
+    # Download model
+    if not download_if_missing(FACE_LANDMARKER_URL, FACE_LANDMARKER_PATH):
+        info["reason"] = "failed to download face_landmarker.task"
+        return img, info
 
+    # Create landmarker
     try:
         BaseOptions = mp.tasks.BaseOptions
         FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -189,41 +192,21 @@ def create_face_landmarker():
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        return FaceLandmarker.create_from_options(options)
-    except Exception:
-        return None
-
-
-def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = False):
-    """
-    Face crop using FaceLandmarker mesh landmarks.
-    Returns: (cropped_img, info_dict)
-
-    If anything fails, returns original image with info['ok']=False and reason.
-    """
-    info = {"ok": False, "reason": "", "faces": 0, "model_path": str(FACE_LANDMARKER_PATH)}
-
-    # Fix iPhone/Android EXIF rotation
-    img = ImageOps.exif_transpose(img).convert("RGB")
-
-    landmarker = create_face_landmarker()
-    if landmarker is None:
-        info["reason"] = "FaceLandmarker unavailable (mediapipe install / model download / runtime issue)"
+        landmarker = FaceLandmarker.create_from_options(options)
+    except Exception as e:
+        info["reason"] = f"FaceLandmarker create failed: {e}"
         return img, info
 
     try:
-        import mediapipe as mp
-
-        # detect on downscaled image for speed, crop on original using normalized coords
+        # Detect on downscaled copy for speed, but crop on original using normalized coords
         work = img.copy()
         work.thumbnail((720, 720))
         np_work = np.array(work)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np_work)
 
         result = landmarker.detect(mp_image)
-
         if not getattr(result, "face_landmarks", None):
-            info["reason"] = "No face landmarks detected"
+            info["reason"] = "no face landmarks detected"
             return img, info
 
         info["faces"] = len(result.face_landmarks)
@@ -231,13 +214,11 @@ def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = Fa
 
         xs = np.array([p.x for p in lm], dtype=np.float32)
         ys = np.array([p.y for p in lm], dtype=np.float32)
-
         minx, maxx = float(xs.min()), float(xs.max())
         miny, maxy = float(ys.min()), float(ys.max())
 
         bw = max(1e-6, maxx - minx)
         bh = max(1e-6, maxy - miny)
-
         minx -= margin * bw
         maxx += margin * bw
         miny -= margin * bh
@@ -249,7 +230,6 @@ def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = Fa
         miny = max(0.0, min(1.0, miny))
         maxy = max(0.0, min(1.0, maxy))
 
-        # crop on original image using normalized coords
         orig = np.array(img)
         H, W = orig.shape[:2]
         x1, x2 = int(minx * W), int(maxx * W)
@@ -261,7 +241,7 @@ def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = Fa
             info["orig_size"] = [W, H]
 
         if x2 <= x1 or y2 <= y1:
-            info["reason"] = "Invalid crop box"
+            info["reason"] = "invalid crop box"
             return img, info
 
         crop = orig[y1:y2, x1:x2]
@@ -270,7 +250,7 @@ def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = Fa
         return Image.fromarray(crop), info
 
     except Exception as e:
-        info["reason"] = f"Landmarker runtime error: {e}"
+        info["reason"] = f"landmarker runtime error: {e}"
         return img, info
     finally:
         try:
@@ -279,8 +259,96 @@ def face_crop_pil_exact(img: Image.Image, margin: float = 0.05, debug: bool = Fa
             pass
 
 
+def crop_with_opencv_haar(img: Image.Image, margin: float, debug: bool):
+    """
+    OpenCV Haar cascade fallback. Returns (cropped_img, info_dict).
+    """
+    info = {
+        "ok": False,
+        "backend": "opencv_haar",
+        "reason": "",
+        "faces": 0,
+        "model_path": str(HAAR_PATH),
+    }
+
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    try:
+        import cv2
+    except Exception as e:
+        info["reason"] = f"opencv import failed: {e}"
+        return img, info
+
+    if not download_if_missing(HAAR_URL, HAAR_PATH):
+        info["reason"] = "failed to download haarcascade xml"
+        return img, info
+
+    # Downscale for detection speed; map back to original
+    work = img.copy()
+    work.thumbnail((720, 720))
+    np_work = np.array(work)
+    gray = cv2.cvtColor(np_work, cv2.COLOR_RGB2GRAY)
+
+    cascade = cv2.CascadeClassifier(str(HAAR_PATH))
+    if cascade.empty():
+        info["reason"] = "cascade classifier failed to load"
+        return img, info
+
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    if faces is None or len(faces) == 0:
+        info["reason"] = "no face detected by haar cascade"
+        return img, info
+
+    info["faces"] = int(len(faces))
+
+    # pick the largest face
+    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+
+    # map coords to original
+    sx = img.size[0] / work.size[0]
+    sy = img.size[1] / work.size[1]
+    x, y, w, h = int(x * sx), int(y * sy), int(w * sx), int(h * sy)
+
+    # expand
+    cx, cy = x + w / 2, y + h / 2
+    size = max(w, h) * (1.0 + margin * 2.0)
+    x1 = int(max(0, cx - size / 2))
+    y1 = int(max(0, cy - size / 2))
+    x2 = int(min(img.size[0], cx + size / 2))
+    y2 = int(min(img.size[1], cy + size / 2))
+
+    if debug:
+        info["px_box"] = [x1, y1, x2, y2]
+        info["orig_size"] = [img.size[0], img.size[1]]
+
+    if x2 <= x1 or y2 <= y1:
+        info["reason"] = "invalid crop box"
+        return img, info
+
+    crop = np.array(img)[y1:y2, x1:x2]
+    info["ok"] = True
+    info["reason"] = "cropped"
+    return Image.fromarray(crop), info
+
+
+def face_crop_auto(img: Image.Image, margin: float, debug: bool):
+    """
+    Try MediaPipe first, then OpenCV Haar fallback.
+    """
+    cropped, info = crop_with_mediapipe_landmarks(img, margin=margin, debug=debug)
+    if info.get("ok"):
+        return cropped, info
+
+    cropped2, info2 = crop_with_opencv_haar(img, margin=margin, debug=debug)
+    if info2.get("ok"):
+        return cropped2, info2
+
+    # both failed -> return original with combined info
+    return img, {"ok": False, "backend": "none", "reason": f"mediapipe: {info.get('reason')} | opencv: {info2.get('reason')}"}
+
+
 # -------------------------
-# Robust CLIP embedding extraction -> ALWAYS returns (B, 512)
+# CLIP embedding (robust)
 # -------------------------
 @torch.no_grad()
 def get_clip_image_embeds(model: CLIPModel, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -304,22 +372,20 @@ def get_clip_image_embeds(model: CLIPModel, pixel_values: torch.Tensor) -> torch
                 if name == "last_hidden_state":
                     t = t[:, 0, :]
                 return t
-
-    raise TypeError(f"Could not extract tensor embeddings from model output: {type(out)}")
+    raise TypeError(f"Could not extract embeddings from model output: {type(out)}")
 
 
 @torch.no_grad()
 def embed_one(img: Image.Image, model, processor, device) -> np.ndarray:
     inputs = processor(images=[img.convert("RGB")], return_tensors="pt")
     pixel_values = inputs["pixel_values"].to(device)
-
     feat = get_clip_image_embeds(model, pixel_values)
     feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
 # -------------------------
-# Confidence scoring (softmax over Top-N)
+# Confidence
 # -------------------------
 def softmax(x):
     x = np.array(x, dtype=np.float32)
@@ -331,7 +397,6 @@ def softmax(x):
 def best_match_with_confidence(embs, q, topN=50, temperature=20.0):
     sims = embs @ q
     idx_sorted = np.argsort(-sims)
-
     best_i = int(idx_sorted[0])
     best_sim = float(sims[best_i])
 
@@ -346,30 +411,29 @@ def best_match_with_confidence(embs, q, topN=50, temperature=20.0):
 # -------------------------
 # UI
 # -------------------------
-st.title("🪶 BirdLookalike — Mobile Camera + Compact UI + Face Crop Debug")
+st.title("🪶 BirdLookalike — Mobile Camera + Robust Face Crop")
 
 model, processor, device = load_clip()
 embs, meta = load_index()
 
-# Mobile compact controls
 source = st.radio("Input source", ["📷 Camera", "🖼️ Upload"], horizontal=True)
 
+# Defaults
+use_crop = True
+crop_margin = 0.06
+debug_crop = False
+topN = min(50, len(meta))
+temperature = 20.0
+
 with st.expander("⚙️ Settings", expanded=False):
-    use_crop = st.checkbox("Crop face (FaceLandmarker mesh)", value=True)
-    crop_margin = st.slider(
-        "Crop margin (tight → loose)",
-        0.02, 0.15, 0.05, 0.01,
-        help="Smaller = tighter. If forehead/hair is cut, increase slightly."
-    )
-    debug_crop = st.checkbox("Debug face crop", value=False)
+    use_crop = st.checkbox("Crop face (MediaPipe → OpenCV fallback)", value=True)
+    crop_margin = st.slider("Crop margin", 0.02, 0.20, float(crop_margin), 0.01)
+    debug_crop = st.checkbox("Debug crop", value=False)
+    topN = st.slider("Top-N competitors", 10, 200, int(topN))
+    temperature = st.slider("Temperature", 5.0, 40.0, float(temperature), 1.0)
 
-    st.markdown("### Confidence")
-    topN = st.slider("Top-N competitors", 10, 200, min(50, len(meta)))
-    temperature = st.slider("Temperature", 5.0, 40.0, 20.0, 1.0)
+st.caption(f"Device: {device} | Birds indexed: {len(meta)}")
 
-st.caption(f"Device: {device} | Indexed bird images: {len(meta)}")
-
-# Input widget
 if source == "📷 Camera":
     up = st.camera_input("Take a photo")
 else:
@@ -379,49 +443,41 @@ if not up:
     st.info("Capture or upload a photo to continue.")
     st.stop()
 
-# Works for both camera_input and file_uploader
 img = Image.open(BytesIO(up.getvalue())).convert("RGB")
 
-# Face crop
 if use_crop:
-    img_in, crop_info = face_crop_pil_exact(img, margin=crop_margin, debug=debug_crop)
+    img_in, crop_info = face_crop_auto(img, margin=crop_margin, debug=debug_crop)
     if debug_crop:
         st.json(crop_info)
 else:
     img_in = ImageOps.exif_transpose(img).convert("RGB")
 
-# Embed + match
 q = embed_one(img_in, model, processor, device)
 best_i, best_sim, best_conf, idx_sorted, sims = best_match_with_confidence(
     embs, q, topN=topN, temperature=temperature
 )
 best = meta[best_i]
 
-# Display (compact)
 st.subheader("Input (used for embedding)")
 st.image(resize_for_display(img_in), width=DISPLAY_MAX_W)
 
 st.subheader("✅ Best match")
-st.markdown(f"### **{best['species']}**")
+st.markdown(f"### **{best.get('species','Unknown')}**")
 c1, c2 = st.columns(2)
 c1.metric("Similarity", f"{best_sim:.3f}")
 c2.metric("Confidence", f"{best_conf * 100:.1f}%")
 
-# Bird image (optional) in expander to keep UI clean on mobile
-bird_path = resolve_asset(best["path"])
+bird_path = resolve_asset(best.get("path", ""))
 if bird_path.exists():
     with st.expander("🖼️ Show matched bird image", expanded=False):
         bird_img = Image.open(str(bird_path)).convert("RGB")
-        st.image(resize_for_display(bird_img), caption=f"{best['species']} | {bird_path.name}", width=DISPLAY_MAX_W)
+        st.image(resize_for_display(bird_img), caption=f"{best.get('species','Unknown')} | {bird_path.name}", width=DISPLAY_MAX_W)
 else:
     st.warning(
-        "Bird image file not found in this deployment. "
-        "To show bird images on Streamlit Cloud, include the birds/ folder in the GitHub repo "
-        "or use a birds_preview/ folder (one image per species)."
+        "Bird image file not found in this deployment. Include birds/ in the GitHub repo to display it."
     )
 
 with st.expander("Runner-ups", expanded=False):
-    runner_k = min(5, len(meta) - 1)
-    for j in idx_sorted[1 : 1 + runner_k]:
+    for j in idx_sorted[1:6]:
         m = meta[int(j)]
-        st.write(f"- {m['species']}  (sim={float(sims[int(j)]):.3f})")
+        st.write(f"- {m.get('species','Unknown')}  (sim={float(sims[int(j)]):.3f})")
